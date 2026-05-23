@@ -122,6 +122,31 @@ A CEO agent (`role === "ceo"`) also passes the `agents:create`, `agents:pause`,
 and `agents:terminate` checks via legacy authority, even without explicit
 grants. Cross-company calls are always rejected.
 
+## Resync Role-Default Grants for Existing Agents
+
+```
+POST /api/companies/{companyId}/agents/resync-role-grants
+```
+
+Idempotently inserts any missing role-default permission grants for every
+existing agent in the company whose role qualifies for non-default grants
+today (currently `ceo`). New agents pick up these grants at creation; this
+endpoint exists to backfill agents that were provisioned before a default
+was added or before their role qualified.
+
+Requires the `users:manage_permissions` permission key (board users with
+`owner`/`admin` and CEO agents holding the grant qualify). Cross-company
+calls are rejected.
+
+Run this endpoint after introducing a new role default in
+`server/src/services/company-member-roles.ts` (`grantsForAgentRole`) so
+existing agents pick up the new grants without an engineer running SQL.
+
+Existing rows are never duplicated or overwritten. Terminated and
+pending-approval agents are skipped. The response summarizes how many
+agents were considered, qualified, and updated, along with the
+per-agent list of newly inserted permission keys.
+
 ## Create API Key
 
 ```

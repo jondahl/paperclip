@@ -1,5 +1,5 @@
 import { PERMISSION_KEYS } from "@paperclipai/shared";
-import type { HumanCompanyMembershipRole } from "@paperclipai/shared";
+import type { AgentRole, HumanCompanyMembershipRole } from "@paperclipai/shared";
 
 const HUMAN_COMPANY_MEMBERSHIP_ROLES: HumanCompanyMembershipRole[] = [
   "owner",
@@ -51,6 +51,37 @@ export function grantsForHumanRole(
     case "viewer":
       return [];
   }
+}
+
+type GrantSpec = {
+  permissionKey: (typeof PERMISSION_KEYS)[number];
+  scope: Record<string, unknown> | null;
+};
+
+// Source of truth for default permission grants by agent role. The backfill
+// in POST /api/companies/:companyId/agents/resync-role-grants derives the
+// desired grant set from this function, so updating defaults here propagates
+// to existing agents on the next resync.
+export function grantsForAgentRole(role: AgentRole | string): GrantSpec[] {
+  switch (role) {
+    case "ceo":
+      return [
+        { permissionKey: "agents:create", scope: null },
+        { permissionKey: "agents:pause", scope: null },
+        { permissionKey: "agents:terminate", scope: null },
+        { permissionKey: "tasks:assign", scope: null },
+      ];
+    default:
+      return [{ permissionKey: "tasks:assign", scope: null }];
+  }
+}
+
+// An agent role "qualifies" for the resync if its defaults include any grants
+// beyond the universal tasks:assign baseline. Non-qualifying roles are skipped
+// to avoid touching IC agents that already have the only grant they should.
+export function agentRoleQualifiesForGrantResync(role: AgentRole | string): boolean {
+  const desired = grantsForAgentRole(role);
+  return desired.some((grant) => grant.permissionKey !== "tasks:assign");
 }
 
 export function resolveHumanInviteRole(

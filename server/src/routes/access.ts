@@ -70,6 +70,7 @@ import {
   resolveHumanInviteRole,
 } from "../services/company-member-roles.js";
 import { humanJoinGrantsFromDefaults } from "../services/invite-grants.js";
+import { resyncAgentRoleGrantsForCompany } from "../services/agent-role-grant-resync.js";
 import {
   collapseDuplicatePendingHumanJoinRequests,
   findReusableHumanJoinRequest,
@@ -4255,6 +4256,39 @@ export function accessRoutes(
       );
       if (!member) throw notFound("Member not found");
       res.json(member);
+    }
+  );
+
+  router.post(
+    "/companies/:companyId/agents/resync-role-grants",
+    async (req, res) => {
+      const companyId = req.params.companyId as string;
+      await assertCompanyPermission(req, companyId, "users:manage_permissions");
+
+      const summary = await resyncAgentRoleGrantsForCompany(db, {
+        companyId,
+        grantedByUserId: req.actor.userId ?? null,
+      });
+
+      await logActivity(db, {
+        companyId,
+        actorType: req.actor.type === "agent" ? "agent" : "user",
+        actorId:
+          req.actor.type === "agent"
+            ? (req.actor.agentId ?? "agent")
+            : (req.actor.userId ?? "board"),
+        action: "company.agent_role_grants_resynced",
+        entityType: "company",
+        entityId: companyId,
+        details: {
+          agentsConsidered: summary.agentsConsidered,
+          agentsQualified: summary.agentsQualified,
+          agentsUpdated: summary.agentsUpdated,
+          grantsInserted: summary.grantsInserted,
+        },
+      });
+
+      res.json(summary);
     }
   );
 
