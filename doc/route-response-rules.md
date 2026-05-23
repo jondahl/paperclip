@@ -29,20 +29,42 @@ If step 5 (serialization) can fail, the route must either:
 
 ## Rule 2 — Observability must never fail the request
 
-`logActivity` is observability bookkeeping. By the time it runs, the side
-effect is already committed. It must never throw. The function is implemented
-to swallow and warn on failure for that reason — do not "fix" that try/catch.
+Observability bookkeeping runs after the side effect commits. It must never
+throw. The shared primitives have all been hardened so the rule is enforced
+at the call site once, not at every caller — **do not "fix" their internal
+try/catch**:
+
+- `logActivity` (`server/src/services/activity-log.ts`) — wraps the activity
+  insert, `publishLiveEvent`, and `publishPluginDomainEvent` calls (PLA-9).
+- `publishLiveEvent` / `publishGlobalLiveEvent`
+  (`server/src/services/live-events.ts`) — Node's `EventEmitter` dispatches
+  listeners synchronously, so a buggy subscriber (e.g. `socket.send` on a
+  closing WebSocket) would propagate to the publisher. The emit call is
+  wrapped (PLA-12).
+- `publishPluginDomainEvent` — already fire-and-forget via
+  `.then().catch(() => {})`.
+- `TelemetryClient.track` (`packages/shared/src/telemetry/client.ts`) — the
+  entire body (including `getState()` on first call, which can hit disk) is
+  wrapped (PLA-12). Telemetry is best-effort; it must never 5xx a caller.
 
 Foreign-key constraints on observability tables (e.g.
 `activity_log.run_id → heartbeat_runs.id`) are best-effort: a stale or
-unknown run id should produce a warning, not a 5xx for the caller. The same
-principle applies to:
+unknown run id should produce a warning, not a 5xx for the caller. Likewise a
+listener throwing on a stale WebSocket, or a telemetry state file that can't
+be read on first use, must not surface to the request handler.
 
-- `publishLiveEvent`
-- `publishPluginDomainEvent`
-- `getTelemetryClient()` + `track*` calls
+If you add a new post-commit hook (telemetry, plugin event, broadcast,
+metrics, log shipping, etc.), it must absorb its own failures the same way.
+Wrap it at the primitive, not at every caller.
 
-If you add a new post-commit hook, wrap it.
+Regression tests pinning these guarantees:
+
+- `server/src/__tests__/activity-log-resilience.test.ts` — `logActivity`
+  swallows FK violation on dangling `runId` (PLA-9).
+- `server/src/__tests__/live-events-resilience.test.ts` — `publishLiveEvent`
+  / `publishGlobalLiveEvent` swallow listener throws (PLA-12).
+- `packages/shared/src/telemetry/client.test.ts` — `TelemetryClient.track`
+  swallows state-factory failure (PLA-12).
 
 ## Rule 3 — Retries must be idempotent at the protocol level
 
