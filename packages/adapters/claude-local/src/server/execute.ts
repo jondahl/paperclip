@@ -60,6 +60,10 @@ import { resolveClaudeDesiredSkillNames } from "./skills.js";
 import { isBedrockModelId } from "./models.js";
 import { prepareClaudePromptBundle } from "./prompt-cache.js";
 import { buildClaudeExecutionPermissionArgs } from "./permissions.js";
+import {
+  buildDeferredToolDenylistArgs,
+  resolveDeferredToolDenylist,
+} from "./deferred-tool-denylist.js";
 import { SANDBOX_INSTALL_COMMAND } from "../index.js";
 
 const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
@@ -672,6 +676,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     heartbeatPromptChars: renderedPrompt.length,
   };
 
+  const deferredToolDenylist = resolveDeferredToolDenylist(config);
+
   const buildClaudeArgs = (
     resumeSessionId: string | null,
     attemptInstructionsFilePath: string | undefined,
@@ -682,6 +688,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       dangerouslySkipPermissions,
       targetIsSandbox: executionTargetIsSandbox,
     }));
+    args.push(...buildDeferredToolDenylistArgs(deferredToolDenylist));
     if (chrome) args.push("--chrome");
     // For Bedrock: only pass --model when the ID is a Bedrock-native identifier
     // (e.g. "us.anthropic.*" or ARN). Anthropic-style IDs like "claude-opus-4-6" are invalid
