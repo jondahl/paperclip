@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   extractClaudeRetryNotBefore,
   isClaudeTransientUpstreamError,
+  parseClaudeStreamJson,
 } from "./parse.js";
 
 describe("isClaudeTransientUpstreamError", () => {
@@ -119,5 +120,49 @@ describe("extractClaudeRetryNotBefore", () => {
     expect(
       extractClaudeRetryNotBefore({ errorMessage: "Overloaded. Try again later." }, new Date()),
     ).toBeNull();
+  });
+});
+
+describe("parseClaudeStreamJson usage extraction", () => {
+  it("captures cache_read and cache_creation tokens separately from billed input", () => {
+    const stream = [
+      JSON.stringify({
+        type: "system",
+        subtype: "init",
+        session_id: "sess_1",
+        model: "claude-sonnet-4-6",
+      }),
+      JSON.stringify({
+        type: "result",
+        session_id: "sess_1",
+        result: "done",
+        total_cost_usd: 0.012,
+        usage: {
+          input_tokens: 500,
+          output_tokens: 1200,
+          cache_read_input_tokens: 18000,
+          cache_creation_input_tokens: 3500,
+        },
+      }),
+    ].join("\n");
+
+    const parsed = parseClaudeStreamJson(stream);
+    expect(parsed.usage).toEqual({
+      inputTokens: 500,
+      cachedInputTokens: 18000,
+      cacheCreationTokens: 3500,
+      outputTokens: 1200,
+    });
+  });
+
+  it("defaults cache fields to 0 when the provider omits them", () => {
+    const stream = JSON.stringify({
+      type: "result",
+      result: "ok",
+      usage: { input_tokens: 10, output_tokens: 20 },
+    });
+    const parsed = parseClaudeStreamJson(stream);
+    expect(parsed.usage?.cacheCreationTokens).toBe(0);
+    expect(parsed.usage?.cachedInputTokens).toBe(0);
   });
 });

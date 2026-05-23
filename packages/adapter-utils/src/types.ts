@@ -31,6 +31,15 @@ export interface UsageSummary {
   inputTokens: number;
   outputTokens: number;
   cachedInputTokens?: number;
+  /**
+   * Prompt-cache write tokens for this run.
+   *
+   * Anthropic Messages API surfaces this as `usage.cache_creation_input_tokens`.
+   * Adapters that do not expose cache-write metrics should leave this undefined
+   * (or set 0) — telemetry persists it as 0 with a documented gap rather than
+   * inferring a value.
+   */
+  cacheCreationTokens?: number;
 }
 
 export type AdapterBillingType =

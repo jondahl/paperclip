@@ -1185,6 +1185,7 @@ async function buildAgentContext(
           model: asString(usage.model),
           inputTokens: asNumber(usage.inputTokens) ?? asNumber(usage.rawInputTokens),
           cachedInputTokens: asNumber(usage.cachedInputTokens) ?? asNumber(usage.rawCachedInputTokens),
+          cacheCreationTokens: asNumber(usage.cacheCreationTokens) ?? asNumber(usage.rawCacheCreationTokens),
           outputTokens: asNumber(usage.outputTokens) ?? asNumber(usage.rawOutputTokens),
           costUsd: asNumber(usage.costUsd),
           usageSource: asString(usage.usageSource),

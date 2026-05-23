@@ -1030,6 +1030,7 @@ interface WakeupOptions {
 type UsageTotals = {
   inputTokens: number;
   cachedInputTokens: number;
+  cacheCreationTokens: number;
   outputTokens: number;
 };
 
@@ -1442,6 +1443,7 @@ function normalizeUsageTotals(usage: UsageSummary | null | undefined): UsageTota
   return {
     inputTokens: Math.max(0, Math.floor(asNumber(usage.inputTokens, 0))),
     cachedInputTokens: Math.max(0, Math.floor(asNumber(usage.cachedInputTokens, 0))),
+    cacheCreationTokens: Math.max(0, Math.floor(asNumber(usage.cacheCreationTokens, 0))),
     outputTokens: Math.max(0, Math.floor(asNumber(usage.outputTokens, 0))),
   };
 }
@@ -1458,18 +1460,23 @@ function readRawUsageTotals(usageJson: unknown): UsageTotals | null {
     0,
     Math.floor(asNumber(parsed.rawCachedInputTokens, asNumber(parsed.cachedInputTokens, 0))),
   );
+  const cacheCreationTokens = Math.max(
+    0,
+    Math.floor(asNumber(parsed.rawCacheCreationTokens, asNumber(parsed.cacheCreationTokens, 0))),
+  );
   const outputTokens = Math.max(
     0,
     Math.floor(asNumber(parsed.rawOutputTokens, asNumber(parsed.outputTokens, 0))),
   );
 
-  if (inputTokens <= 0 && cachedInputTokens <= 0 && outputTokens <= 0) {
+  if (inputTokens <= 0 && cachedInputTokens <= 0 && cacheCreationTokens <= 0 && outputTokens <= 0) {
     return null;
   }
 
   return {
     inputTokens,
     cachedInputTokens,
+    cacheCreationTokens,
     outputTokens,
   };
 }
@@ -1484,6 +1491,9 @@ function deriveNormalizedUsageDelta(current: UsageTotals | null, previous: Usage
   const cachedInputTokens = current.cachedInputTokens >= previous.cachedInputTokens
     ? current.cachedInputTokens - previous.cachedInputTokens
     : current.cachedInputTokens;
+  const cacheCreationTokens = current.cacheCreationTokens >= previous.cacheCreationTokens
+    ? current.cacheCreationTokens - previous.cacheCreationTokens
+    : current.cacheCreationTokens;
   const outputTokens = current.outputTokens >= previous.outputTokens
     ? current.outputTokens - previous.outputTokens
     : current.outputTokens;
@@ -1491,6 +1501,7 @@ function deriveNormalizedUsageDelta(current: UsageTotals | null, previous: Usage
   return {
     inputTokens: Math.max(0, inputTokens),
     cachedInputTokens: Math.max(0, cachedInputTokens),
+    cacheCreationTokens: Math.max(0, cacheCreationTokens),
     outputTokens: Math.max(0, outputTokens),
   };
 }
@@ -7925,6 +7936,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               ...(rawUsage ? {
                 rawInputTokens: rawUsage.inputTokens,
                 rawCachedInputTokens: rawUsage.cachedInputTokens,
+                rawCacheCreationTokens: rawUsage.cacheCreationTokens,
                 rawOutputTokens: rawUsage.outputTokens,
               } : {}),
               ...(sessionUsageResolution.derivedFromSessionTotals ? { usageSource: "session_delta" } : {}),
