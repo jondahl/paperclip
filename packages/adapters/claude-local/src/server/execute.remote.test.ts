@@ -328,4 +328,125 @@ describe("claude remote execution", () => {
     expect(call?.[2]).toContain("session-123");
   });
 
+  it("emits --disallowedTools with the default deferred-tool denylist", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-claude-denylist-"));
+    cleanupDirs.push(rootDir);
+    const workspaceDir = path.join(rootDir, "workspace");
+    await mkdir(workspaceDir, { recursive: true });
+
+    await execute({
+      runId: "run-denylist-default",
+      agent: {
+        id: "agent-1",
+        companyId: "company-1",
+        name: "Claude Coder",
+        adapterType: "claude_local",
+        adapterConfig: {},
+      },
+      runtime: {
+        sessionId: null,
+        sessionParams: null,
+        sessionDisplayId: null,
+        taskKey: null,
+      },
+      config: { command: "claude", cwd: workspaceDir },
+      context: {
+        paperclipWorkspace: { cwd: workspaceDir, source: "project_primary" },
+      },
+      onLog: async () => {},
+    });
+
+    expect(runChildProcess).toHaveBeenCalledTimes(1);
+    const call = runChildProcess.mock.calls[0] as unknown as [string, string, string[]] | undefined;
+    const args = call?.[2] ?? [];
+    const flagIndex = args.indexOf("--disallowedTools");
+    expect(flagIndex).toBeGreaterThanOrEqual(0);
+    const value = args[flagIndex + 1] ?? "";
+    // Spot-check both PLA-96 (Mux_Video) and PLA-94 (Mux_read-only) entries
+    // are present in the single joined argument.
+    expect(value).toContain("mcp__claude_ai_Mux_Video__*");
+    expect(value).toContain("mcp__claude_ai_Mux_read-only__*");
+    expect(value).toContain("mcp__claude_ai_NetSuite__*");
+    // Keep-list entries must NOT appear in the joined value.
+    expect(value).not.toContain("mcp__claude_ai_Linear__");
+    expect(value).not.toContain("mcp__claude_ai_Slack__");
+  });
+
+  it("honors a per-agent deferredToolDenylist override", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-claude-denylist-override-"));
+    cleanupDirs.push(rootDir);
+    const workspaceDir = path.join(rootDir, "workspace");
+    await mkdir(workspaceDir, { recursive: true });
+
+    await execute({
+      runId: "run-denylist-override",
+      agent: {
+        id: "agent-1",
+        companyId: "company-1",
+        name: "Claude Coder",
+        adapterType: "claude_local",
+        adapterConfig: {},
+      },
+      runtime: {
+        sessionId: null,
+        sessionParams: null,
+        sessionDisplayId: null,
+        taskKey: null,
+      },
+      config: {
+        command: "claude",
+        cwd: workspaceDir,
+        deferredToolDenylist: ["mcp__claude_ai_OnlyThis__*"],
+      },
+      context: {
+        paperclipWorkspace: { cwd: workspaceDir, source: "project_primary" },
+      },
+      onLog: async () => {},
+    });
+
+    expect(runChildProcess).toHaveBeenCalledTimes(1);
+    const call = runChildProcess.mock.calls[0] as unknown as [string, string, string[]] | undefined;
+    const args = call?.[2] ?? [];
+    const flagIndex = args.indexOf("--disallowedTools");
+    expect(flagIndex).toBeGreaterThanOrEqual(0);
+    expect(args[flagIndex + 1]).toBe("mcp__claude_ai_OnlyThis__*");
+  });
+
+  it("emits no --disallowedTools flag when the denylist is explicitly empty", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-claude-denylist-empty-"));
+    cleanupDirs.push(rootDir);
+    const workspaceDir = path.join(rootDir, "workspace");
+    await mkdir(workspaceDir, { recursive: true });
+
+    await execute({
+      runId: "run-denylist-empty",
+      agent: {
+        id: "agent-1",
+        companyId: "company-1",
+        name: "Claude Coder",
+        adapterType: "claude_local",
+        adapterConfig: {},
+      },
+      runtime: {
+        sessionId: null,
+        sessionParams: null,
+        sessionDisplayId: null,
+        taskKey: null,
+      },
+      config: {
+        command: "claude",
+        cwd: workspaceDir,
+        deferredToolDenylist: [],
+      },
+      context: {
+        paperclipWorkspace: { cwd: workspaceDir, source: "project_primary" },
+      },
+      onLog: async () => {},
+    });
+
+    expect(runChildProcess).toHaveBeenCalledTimes(1);
+    const call = runChildProcess.mock.calls[0] as unknown as [string, string, string[]] | undefined;
+    expect(call?.[2]).not.toContain("--disallowedTools");
+  });
+
 });
