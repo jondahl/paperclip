@@ -28,17 +28,27 @@ export class TelemetryClient {
   }
 
   track(eventName: TelemetryEventName, dimensions?: Record<string, string | number | boolean>): void {
-    if (!this.config.enabled) return;
-    this.getState(); // ensure state is initialised (side-effect: creates state file on first call)
+    // Post-commit observability: callers invoke track() after the irreversible
+    // side effect has committed. A throw here (e.g. stateFactory fails to read
+    // or write the install-id file on first use) must not surface as a 5xx for
+    // a request whose work already persisted; the resulting client retry would
+    // produce duplicates. See PLA-9 / PLA-12 and doc/route-response-rules.md.
+    try {
+      if (!this.config.enabled) return;
+      this.getState(); // ensure state is initialised (side-effect: creates state file on first call)
 
-    this.queue.push({
-      name: eventName,
-      occurredAt: new Date().toISOString(),
-      dimensions: dimensions ?? {},
-    });
+      this.queue.push({
+        name: eventName,
+        occurredAt: new Date().toISOString(),
+        dimensions: dimensions ?? {},
+      });
 
-    if (this.queue.length >= BATCH_SIZE) {
-      void this.flush();
+      if (this.queue.length >= BATCH_SIZE) {
+        void this.flush();
+      }
+    } catch {
+      // Swallow: telemetry is best-effort observability. The caller's request
+      // has already committed; never let an instrumentation failure 5xx them.
     }
   }
 
