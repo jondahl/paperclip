@@ -11,6 +11,7 @@ import {
   parseClaudeCliUsageText,
   readClaudeToken,
   claudeConfigDir,
+  claudeSubscriptionHidesUsage,
 } from "@paperclipai/adapter-claude-local/server";
 
 import {
@@ -297,6 +298,32 @@ describe("readClaudeToken", () => {
     const token = await readClaudeToken();
     expect(token).toBe("dotfile-token");
     await import("node:fs/promises").then((fs) => fs.rm(tmpDir, { recursive: true }));
+  });
+});
+
+describe("claudeSubscriptionHidesUsage", () => {
+  it("returns false when not logged in", () => {
+    expect(claudeSubscriptionHidesUsage(null)).toBe(false);
+    expect(claudeSubscriptionHidesUsage({ loggedIn: false, authMethod: "claude.ai", subscriptionType: "team" })).toBe(false);
+  });
+
+  it("returns false for API-key auth (no claude.ai session)", () => {
+    expect(claudeSubscriptionHidesUsage({ loggedIn: true, authMethod: "api_key", subscriptionType: null })).toBe(false);
+  });
+
+  it("returns false for personal claude.ai plans that do expose per-user usage", () => {
+    for (const plan of ["pro", "max5x", "max20x"]) {
+      expect(claudeSubscriptionHidesUsage({ loggedIn: true, authMethod: "claude.ai", subscriptionType: plan })).toBe(false);
+    }
+  });
+
+  it("returns true for claude.ai team subscriptions", () => {
+    expect(claudeSubscriptionHidesUsage({ loggedIn: true, authMethod: "claude.ai", subscriptionType: "team" })).toBe(true);
+    expect(claudeSubscriptionHidesUsage({ loggedIn: true, authMethod: "claude.ai", subscriptionType: "Team" })).toBe(true);
+  });
+
+  it("returns true for claude.ai enterprise subscriptions", () => {
+    expect(claudeSubscriptionHidesUsage({ loggedIn: true, authMethod: "claude.ai", subscriptionType: "enterprise" })).toBe(true);
   });
 });
 

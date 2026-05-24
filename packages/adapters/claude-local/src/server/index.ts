@@ -19,6 +19,7 @@ export {
   toPercent,
   fetchWithTimeout,
   claudeConfigDir,
+  claudeSubscriptionHidesUsage,
 } from "./quota.js";
 import type { AdapterSessionCodec } from "@paperclipai/adapter-utils";
 

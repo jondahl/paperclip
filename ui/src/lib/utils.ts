@@ -124,6 +124,7 @@ export function quotaSourceDisplayName(source: string): string {
   const map: Record<string, string> = {
     "anthropic-oauth": "Anthropic OAuth",
     "claude-cli": "Claude CLI",
+    "anthropic-team-subscription": "Team subscription",
     "bedrock": "AWS Bedrock",
     "codex-rpc": "Codex app server",
     "codex-wham": "ChatGPT WHAM",

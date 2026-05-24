@@ -9,6 +9,22 @@ const execFileAsync = promisify(execFile);
 
 const CLAUDE_USAGE_SOURCE_OAUTH = "anthropic-oauth";
 const CLAUDE_USAGE_SOURCE_CLI = "claude-cli";
+const CLAUDE_USAGE_SOURCE_TEAM = "anthropic-team-subscription";
+
+// Claude.ai subscription types that do not expose per-user usage via the
+// OAuth `/api/oauth/usage` endpoint and whose CLI `/usage` panel does not
+// render the per-user window layout. For these the only org-level usage data
+// lives behind an Admin API key, which a regular team-member session does not
+// hold — so we short-circuit before attempting either failing fallback.
+const CLAUDE_SUBSCRIPTIONS_WITHOUT_PER_USER_USAGE = new Set(["team", "enterprise"]);
+
+/** True when the local Claude auth is a claude.ai login whose plan does not
+ *  expose per-user quota windows (team, enterprise). */
+export function claudeSubscriptionHidesUsage(status: ClaudeAuthStatus | null): boolean {
+  if (!status?.loggedIn || status.authMethod !== "claude.ai") return false;
+  const plan = typeof status.subscriptionType === "string" ? status.subscriptionType.toLowerCase() : "";
+  return CLAUDE_SUBSCRIPTIONS_WITHOUT_PER_USER_USAGE.has(plan);
+}
 
 export function claudeConfigDir(): string {
   const fromEnv = process.env.CLAUDE_CONFIG_DIR;
@@ -489,6 +505,24 @@ export async function getQuotaWindows(): Promise<ProviderQuotaResult> {
 
   const authStatus = await readClaudeAuthStatus();
   const authDescription = describeClaudeSubscriptionAuth(authStatus);
+
+  if (claudeSubscriptionHidesUsage(authStatus)) {
+    return {
+      provider: "anthropic",
+      source: CLAUDE_USAGE_SOURCE_TEAM,
+      ok: true,
+      windows: [
+        {
+          label: "Team subscription",
+          usedPercent: null,
+          resetsAt: null,
+          valueLabel: null,
+          detail: "Anthropic does not expose per-user quota for team subscriptions. See the admin Usage report at console.anthropic.com.",
+        },
+      ],
+    };
+  }
+
   const token = await readClaudeToken();
 
   const errors: string[] = [];
