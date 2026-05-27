@@ -2338,6 +2338,55 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return updated;
   }
 
+  // PLA-173: A `routine_execution` issue is a discrete unit of work — one scheduled
+  // fire = one pass. When such an issue's latest run terminated `succeeded` and there
+  // is no live execution path, the routine cycle is complete; the routine's cron owns
+  // the next fire. Escalating it to `blocked` (with no real blockers) triggers a
+  // re-run → succeed → re-block thrash loop, so we close the completed pass as `done`.
+  // Failed/errored routine runs are intentionally excluded and fall through to normal
+  // failure recovery.
+  async function completeSuccessfulRoutineExecutionPass(input: {
+    issue: typeof issues.$inferSelect;
+    latestRun: SuccessfulLatestIssueRun;
+  }) {
+    const updated = await issuesSvc.update(input.issue.id, {
+      status: "done",
+    });
+    if (!updated) return null;
+
+    await issuesSvc.addComment(
+      input.issue.id,
+      "Paperclip stranded-issue recovery observed this `routine_execution` issue left `in_progress` after its " +
+        `latest run (\`${input.latestRun.id}\`) terminated \`succeeded\` with no live execution path. A routine ` +
+        "execution is a discrete unit of work — one scheduled fire = one completed pass — so this cycle is done and " +
+        "the routine's next scheduled fire owns continuation. Closing as `done` instead of escalating to `blocked`, " +
+        "which would otherwise re-run and re-block this issue in a loop ([PLA-173](/PLA/issues/PLA-173)).",
+      {},
+      { authorType: "system" },
+    );
+
+    await logActivity(db, {
+      companyId: input.issue.companyId,
+      actorType: "system",
+      actorId: "system",
+      agentId: null,
+      runId: null,
+      action: "issue.updated",
+      entityType: "issue",
+      entityId: input.issue.id,
+      details: {
+        identifier: input.issue.identifier,
+        status: "done",
+        previousStatus: input.issue.status,
+        source: "recovery.reconcile_successful_routine_execution_pass",
+        latestRunId: input.latestRun.id,
+        latestRunStatus: input.latestRun.status,
+      },
+    });
+
+    return updated;
+  }
+
   async function reconcileStrandedAssignedIssues() {
     const candidates = await db
       .select()
@@ -2358,6 +2407,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       successfulContinuationObserved: 0,
       orphanBlockersAssigned: 0,
       successfulRunHandoffEscalated: 0,
+      routineExecutionPassCompleted: 0,
       escalated: 0,
       skipped: 0,
       issueIds: [] as string[],
@@ -2387,6 +2437,21 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       }
 
       const latestRun = await getLatestIssueRun(issue.companyId, issue.id);
+
+      // PLA-173: Successful routine-execution pass with no live path is complete, not
+      // stranded. Close it as `done` here, before any escalation branch, so it is never
+      // pushed into the `blocked` re-run/re-block loop. Failed routine runs fall through.
+      if (issue.originKind === "routine_execution" && isSuccessfulInProgressContinuationRun(latestRun)) {
+        const updated = await completeSuccessfulRoutineExecutionPass({ issue, latestRun });
+        if (updated) {
+          result.routineExecutionPassCompleted += 1;
+          result.issueIds.push(issue.id);
+        } else {
+          result.skipped += 1;
+        }
+        continue;
+      }
+
       if (isStrandedIssueRecoveryIssue(issue) && isUnsuccessfulTerminalIssueRun(latestRun)) {
         const updated = await escalateStrandedRecoveryIssueInPlace({
           issue,
