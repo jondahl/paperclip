@@ -27,9 +27,13 @@ import { instanceSettingsService } from "../services/instance-settings.ts";
 import {
   clampIssueListLimit,
   deriveIssueCommentRunLogAttribution,
+  EXECUTION_LOCK_LEASE_TTL_MS,
+  executionLockLeaseAgeMs,
   ISSUE_LIST_MAX_LIMIT,
   issueService,
 } from "../services/issues.ts";
+import { ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS } from "../services/recovery/service.ts";
+import { runningProcesses } from "../adapters/utils.ts";
 import { buildProjectMentionHref, MAX_ISSUE_REQUEST_DEPTH } from "@paperclipai/shared";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -3105,10 +3109,42 @@ describeEmbeddedPostgres("issueService.findMentionedProjectIds", () => {
   });
 });
 
-describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
+describe("executionLockLeaseAgeMs", () => {
+  it("returns null when the run has no usable activity timestamp", () => {
+    expect(executionLockLeaseAgeMs({}, new Date())).toBeNull();
+    expect(
+      executionLockLeaseAgeMs(
+        { lastOutputAt: null, processStartedAt: null, startedAt: null, createdAt: null },
+        new Date(),
+      ),
+    ).toBeNull();
+  });
+
+  it("measures age from the most recent activity timestamp (greatest, not first non-null)", () => {
+    const now = new Date("2026-05-27T12:00:00.000Z");
+    // createdAt is older, but lastOutputAt is more recent: age must track the freshest.
+    const age = executionLockLeaseAgeMs(
+      {
+        createdAt: new Date("2026-05-27T08:00:00.000Z"),
+        startedAt: new Date("2026-05-27T08:00:00.000Z"),
+        processStartedAt: new Date("2026-05-27T08:05:00.000Z"),
+        lastOutputAt: new Date("2026-05-27T11:50:00.000Z"),
+      },
+      now,
+    );
+    expect(age).toBe(10 * 60 * 1000); // 10 minutes since lastOutputAt
+  });
+
+  it("keeps the execution-lock lease >= the watchdog suspicion threshold (no silent drift)", () => {
+    expect(EXECUTION_LOCK_LEASE_TTL_MS).toBeGreaterThanOrEqual(ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS);
+  });
+});
+
+describeEmbeddedPostgres("issueService.clearExecutionRunIfReleasable", () => {
   let db!: ReturnType<typeof createDb>;
   let svc!: ReturnType<typeof issueService>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+  const trackedRunIds: string[] = [];
 
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-issues-execution-lock-");
@@ -3117,6 +3153,10 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
   }, 20_000);
 
   afterEach(async () => {
+    // Drop any in-memory process handles registered by a test before clearing the DB.
+    while (trackedRunIds.length > 0) {
+      runningProcesses.delete(trackedRunIds.pop()!);
+    }
     await db.delete(issueComments);
     await db.delete(issueRelations);
     await db.delete(issueInboxArchives);
@@ -3136,7 +3176,17 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
     await tempDb?.cleanup();
   });
 
-  async function seedIssueWithRun(status: string | null) {
+  function trackProcess(runId: string) {
+    // Register a fake in-memory process handle so the run looks "alive" to the
+    // orchestrator's runningProcesses map. Cleaned up in afterEach.
+    runningProcesses.set(runId, { child: {} as never, graceSec: 0, processGroupId: null });
+    trackedRunIds.push(runId);
+  }
+
+  async function seedIssueWithRun(
+    status: string | null,
+    opts: { runTimestamps?: Partial<typeof heartbeatRuns.$inferInsert> } = {},
+  ) {
     const companyId = randomUUID();
     const agentId = randomUUID();
     const issueId = randomUUID();
@@ -3166,6 +3216,7 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
         agentId,
         status,
         invocationSource: "manual",
+        ...(opts.runTimestamps ?? {}),
       });
     }
     await db.insert(issues).values({
@@ -3180,15 +3231,11 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
       executionLockedAt: runId ? new Date() : null,
     });
 
-    return { issueId, runId };
+    return { companyId, agentId, issueId, runId };
   }
 
-  it("clears execution locks owned by terminal runs", async () => {
-    const { issueId } = await seedIssueWithRun("failed");
-
-    await expect(svc.clearExecutionRunIfTerminal(issueId)).resolves.toBe(true);
-
-    const row = await db
+  async function readLock(issueId: string) {
+    return db
       .select({
         executionRunId: issues.executionRunId,
         executionAgentNameKey: issues.executionAgentNameKey,
@@ -3197,36 +3244,31 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
       .from(issues)
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0]);
-    expect(row).toEqual({
+  }
+
+  // A date far enough in the past that the lease has expired for any run seeded
+  // with its activity timestamps set to it.
+  function leaseExpiredTimestamps() {
+    const old = new Date(Date.now() - EXECUTION_LOCK_LEASE_TTL_MS - 60 * 60 * 1000);
+    return { createdAt: old, startedAt: old, processStartedAt: old, lastOutputAt: old, lastUsefulActionAt: old };
+  }
+
+  it("clears execution locks owned by terminal runs", async () => {
+    const { issueId } = await seedIssueWithRun("failed");
+
+    await expect(svc.clearExecutionRunIfReleasable(issueId)).resolves.toBe(true);
+
+    expect(await readLock(issueId)).toEqual({
       executionRunId: null,
       executionAgentNameKey: null,
       executionLockedAt: null,
     });
   });
 
-  it("does not clear execution locks owned by live runs", async () => {
-    const { issueId, runId } = await seedIssueWithRun("running");
-
-    await expect(svc.clearExecutionRunIfTerminal(issueId)).resolves.toBe(false);
-
-    const row = await db
-      .select({
-        executionRunId: issues.executionRunId,
-        executionAgentNameKey: issues.executionAgentNameKey,
-        executionLockedAt: issues.executionLockedAt,
-      })
-      .from(issues)
-      .where(eq(issues.id, issueId))
-      .then((rows) => rows[0]);
-    expect(row?.executionRunId).toBe(runId);
-    expect(row?.executionAgentNameKey).toBe("codexcoder");
-    expect(row?.executionLockedAt).toBeInstanceOf(Date);
-  });
-
   it("does not update issues without an execution lock", async () => {
     const { issueId } = await seedIssueWithRun(null);
 
-    await expect(svc.clearExecutionRunIfTerminal(issueId)).resolves.toBe(false);
+    await expect(svc.clearExecutionRunIfReleasable(issueId)).resolves.toBe(false);
 
     const row = await db
       .select({ executionRunId: issues.executionRunId, executionLockedAt: issues.executionLockedAt })
@@ -3234,5 +3276,125 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0]);
     expect(row).toEqual({ executionRunId: null, executionLockedAt: null });
+  });
+
+  it("does NOT clear a recently-active running run (no false reclaim)", async () => {
+    // Fresh timestamps (default createdAt = now) -> lease not expired.
+    const { issueId, runId } = await seedIssueWithRun("running");
+
+    await expect(svc.clearExecutionRunIfReleasable(issueId)).resolves.toBe(false);
+
+    const row = await readLock(issueId);
+    expect(row?.executionRunId).toBe(runId);
+    expect(row?.executionAgentNameKey).toBe("codexcoder");
+    expect(row?.executionLockedAt).toBeInstanceOf(Date);
+  });
+
+  it("does NOT clear a process-tracked running run even when its lease has expired", async () => {
+    const { issueId, runId } = await seedIssueWithRun("running", {
+      runTimestamps: leaseExpiredTimestamps(),
+    });
+    // Process still tracked in memory -> authoritative liveness signal, never reclaim.
+    trackProcess(runId!);
+
+    await expect(svc.clearExecutionRunIfReleasable(issueId)).resolves.toBe(false);
+
+    expect((await readLock(issueId))?.executionRunId).toBe(runId);
+  });
+
+  it("clears a lease-expired running-run lock that is no longer process-tracked", async () => {
+    const { issueId, runId } = await seedIssueWithRun("running", {
+      runTimestamps: leaseExpiredTimestamps(),
+    });
+    expect(runningProcesses.has(runId!)).toBe(false);
+
+    await expect(svc.clearExecutionRunIfReleasable(issueId)).resolves.toBe(true);
+
+    expect(await readLock(issueId)).toEqual({
+      executionRunId: null,
+      executionAgentNameKey: null,
+      executionLockedAt: null,
+    });
+  });
+
+  it("auto-recovers a ghost lock on the assignee's next checkout (lease-expired, untracked)", async () => {
+    const { companyId, agentId, issueId, runId } = await seedIssueWithRun("running", {
+      runTimestamps: leaseExpiredTimestamps(),
+    });
+    const newRunId = randomUUID();
+    // The assignee's next heartbeat run (the one performing the checkout).
+    await db.insert(heartbeatRuns).values({
+      id: newRunId,
+      companyId,
+      agentId,
+      status: "running",
+      invocationSource: "manual",
+    });
+
+    const result = await svc.checkout(issueId, agentId, ["in_progress"], newRunId);
+
+    // Without liveness-based clearing, the stale ghost lock (executionRunId=runId)
+    // would block the checkout's execution-lock condition and throw a conflict.
+    expect(result.executionRunId).toBe(newRunId);
+    expect(result.executionRunId).not.toBe(runId);
+  });
+
+  it("does NOT auto-recover on checkout while the owning run is process-tracked", async () => {
+    const { agentId, issueId, runId } = await seedIssueWithRun("running", {
+      runTimestamps: leaseExpiredTimestamps(),
+    });
+    trackProcess(runId!);
+    const newRunId = randomUUID();
+
+    await expect(svc.checkout(issueId, agentId, ["in_progress"], newRunId)).rejects.toMatchObject({
+      message: "Issue checkout conflict",
+    });
+    expect((await readLock(issueId))?.executionRunId).toBe(runId);
+  });
+
+  it("create-with-assignee leaves executionRunId null (guards PLA-110 bug #1 from regressing)", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    const created = await svc.create(companyId, {
+      title: "Created with assignee",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: agentId,
+    });
+
+    const row = await db
+      .select({
+        executionRunId: issues.executionRunId,
+        executionAgentNameKey: issues.executionAgentNameKey,
+        executionLockedAt: issues.executionLockedAt,
+        checkoutRunId: issues.checkoutRunId,
+      })
+      .from(issues)
+      .where(eq(issues.id, created.id))
+      .then((rows) => rows[0]);
+    expect(row).toEqual({
+      executionRunId: null,
+      executionAgentNameKey: null,
+      executionLockedAt: null,
+      checkoutRunId: null,
+    });
   });
 });

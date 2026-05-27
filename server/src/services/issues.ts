@@ -52,7 +52,7 @@ import {
 } from "@paperclipai/shared";
 import { conflict, HttpError, notFound, unprocessable } from "../errors.js";
 import { logger } from "../middleware/logger.js";
-import { parseObject } from "../adapters/utils.js";
+import { parseObject, runningProcesses } from "../adapters/utils.js";
 import {
   defaultIssueExecutionWorkspaceSettingsForProject,
   gateProjectExecutionWorkspacePolicy,
@@ -333,6 +333,49 @@ function sameRunLock(checkoutRunId: string | null, actorRunId: string | null) {
 }
 
 const TERMINAL_HEARTBEAT_RUN_STATUSES = new Set(["succeeded", "failed", "cancelled", "timed_out"]);
+
+// Execution-lock lease TTL. A non-terminal ("queued"/"running"/...) run whose OS
+// process is no longer tracked by the orchestrator is treated as "provably dead"
+// once its last observed activity is older than this lease. This lets the
+// owning assignee auto-recover a ghost execution lock on its next
+// checkout/assertCheckoutOwner/release instead of requiring a board-only run
+// cancellation (PLA-110 / PLA-164).
+//
+// Derived conservatively from the active-run-output watchdog suspicion threshold
+// (ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS = 1h, server/src/services/recovery/service.ts)
+// plus a 30-minute safety margin, so we never reclaim a run the watchdog still
+// considers merely "quiet". Defined locally (not imported) to avoid an import
+// cycle: recovery/service.ts already imports the issue service. A regression test
+// asserts this stays >= the suspicion threshold so the two cannot silently drift.
+export const EXECUTION_LOCK_LEASE_TTL_MS = 60 * 60 * 1000 + 30 * 60 * 1000; // 90 minutes
+
+// Age (ms) of a run's last observed activity, used by the execution-lock lease.
+// Mirrors the active-run-output watchdog's basis (recovery/service.ts) but takes
+// the GREATEST of every available activity timestamp, so any recent signal keeps
+// the lock alive (conservative against false reclaim of a live-but-quiet run).
+// Returns null when the run has no usable timestamp at all.
+export function executionLockLeaseAgeMs(
+  run: {
+    lastOutputAt?: Date | null;
+    lastUsefulActionAt?: Date | null;
+    processStartedAt?: Date | null;
+    startedAt?: Date | null;
+    createdAt?: Date | null;
+  },
+  now: Date = new Date(),
+): number | null {
+  const candidates = [
+    run.lastOutputAt,
+    run.lastUsefulActionAt,
+    run.processStartedAt,
+    run.startedAt,
+    run.createdAt,
+  ].filter((value): value is Date => value instanceof Date);
+  if (candidates.length === 0) return null;
+  const mostRecent = candidates.reduce((max, value) => (value.getTime() > max.getTime() ? value : max));
+  return Math.max(0, now.getTime() - mostRecent.getTime());
+}
+
 const ISSUE_LIST_DESCRIPTION_MAX_CHARS = 1200;
 const ISSUE_LIST_DESCRIPTION_MAX_BYTES = ISSUE_LIST_DESCRIPTION_MAX_CHARS * 4;
 
@@ -3392,7 +3435,23 @@ export function issueService(db: Db) {
     return adopted;
   }
 
-  async function clearExecutionRunIfTerminal(issueId: string): Promise<boolean> {
+  // Generalized execution-lock clear predicate (PLA-110 / PLA-164).
+  //
+  // A lock is releasable when the owning run is **terminal OR provably dead**:
+  //   1. terminal  -> run.status in TERMINAL_HEARTBEAT_RUN_STATUSES, or the run
+  //                   row is missing entirely (orphaned lock).
+  //   2. provably dead -> a non-terminal run whose OS process is no longer
+  //                   tracked in `runningProcesses` AND whose last observed
+  //                   activity is older than EXECUTION_LOCK_LEASE_TTL_MS.
+  //
+  // A run whose process is still tracked is NEVER cleared, even if it has been
+  // quiet for a long time (long shell/build with no output) — the in-memory
+  // process handle is the authoritative liveness signal, and the timestamp lease
+  // is only a fallback for when the process is genuinely gone.
+  async function clearExecutionRunIfReleasable(
+    issueId: string,
+    now: Date = new Date(),
+  ): Promise<boolean> {
     return db.transaction(async (tx) => {
       await tx.execute(
         sql`select ${issues.id} from ${issues} where ${issues.id} = ${issueId} for update`,
@@ -3408,11 +3467,26 @@ export function issueService(db: Db) {
         sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${issue.executionRunId} for update`,
       );
       const run = await tx
-        .select({ status: heartbeatRuns.status })
+        .select({
+          status: heartbeatRuns.status,
+          lastOutputAt: heartbeatRuns.lastOutputAt,
+          lastUsefulActionAt: heartbeatRuns.lastUsefulActionAt,
+          processStartedAt: heartbeatRuns.processStartedAt,
+          startedAt: heartbeatRuns.startedAt,
+          createdAt: heartbeatRuns.createdAt,
+        })
         .from(heartbeatRuns)
         .where(eq(heartbeatRuns.id, issue.executionRunId))
         .then((rows) => rows[0] ?? null);
-      if (run && !TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status)) return false;
+
+      // Missing run row -> orphaned lock, always releasable.
+      if (run && !TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status)) {
+        // Non-terminal run: releasable only if provably dead.
+        if (runningProcesses.has(issue.executionRunId)) return false; // process still tracked -> alive
+        const ageMs = executionLockLeaseAgeMs(run, now);
+        if (ageMs === null || ageMs < EXECUTION_LOCK_LEASE_TTL_MS) return false; // lease not yet expired
+        // else: process gone AND lease expired -> provably dead, fall through to clear.
+      }
 
       const updated = await tx
         .update(issues)
@@ -3436,7 +3510,7 @@ export function issueService(db: Db) {
   }
 
   return {
-    clearExecutionRunIfTerminal,
+    clearExecutionRunIfReleasable,
 
     list: async (companyId: string, filters?: IssueFilters) => {
       if (filters?.attention === "blocked") {
@@ -4680,7 +4754,7 @@ export function issueService(db: Db) {
         });
       }
 
-      await clearExecutionRunIfTerminal(id);
+      await clearExecutionRunIfReleasable(id);
 
       const dependencyReadiness = await listIssueDependencyReadinessMap(db, issueCompany.companyId, [id]);
       const unresolvedBlockerIssueIds = dependencyReadiness.get(id)?.unresolvedBlockerIssueIds ?? [];
@@ -4809,7 +4883,7 @@ export function issueService(db: Db) {
     },
 
     assertCheckoutOwner: async (id: string, actorAgentId: string, actorRunId: string | null) => {
-      await clearExecutionRunIfTerminal(id);
+      await clearExecutionRunIfReleasable(id);
       const current = await db
         .select({
           id: issues.id,
@@ -4887,7 +4961,7 @@ export function issueService(db: Db) {
     },
 
     release: async (id: string, actorAgentId?: string, actorRunId?: string | null) => {
-      await clearExecutionRunIfTerminal(id);
+      await clearExecutionRunIfReleasable(id);
       const existing = await db
         .select()
         .from(issues)
