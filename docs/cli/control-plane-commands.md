@@ -108,3 +108,43 @@ pnpm paperclipai dashboard get
 ```sh
 pnpm paperclipai heartbeat run --agent-id <agent-id> [--api-base http://localhost:3100]
 ```
+
+## Token Telemetry
+
+Per-agent / per-role token rollup for a time window. Reads the live
+`GET /api/companies/:id/tokens/snapshot` route, so the target server must be
+running and reachable.
+
+```sh
+# Last 7 days, human-readable summary
+pnpm paperclipai tokens snapshot --company-id <company-id> --days 7 --format summary
+
+# Explicit window, JSON or CSV, optional single-agent filter and week-over-week deltas
+pnpm paperclipai tokens snapshot --company-id <company-id> \
+  --from <iso> --to <iso> [--agent-id <id>] [--week-over-week] [--format json|csv|summary]
+```
+
+Connection + auth are resolved from `--company-id`/`--api-base`/`--api-key`
+flags or the `PAPERCLIP_COMPANY_ID` / `PAPERCLIP_API_URL` / `PAPERCLIP_API_KEY`
+environment variables (or a stored CLI context profile).
+
+### Supported in-repo invocation
+
+The `paperclipai tokens snapshot` command ships in source. Two equivalent ways
+to run it from a checkout (working directory = repo root):
+
+```sh
+pnpm install                 # one-time: wires up workspace runtime deps
+
+# (a) Run directly from source via tsx — no build step needed:
+pnpm paperclipai tokens snapshot --company-id <company-id> --days 7 --format summary
+
+# (b) Run the bundled CLI exactly as published to npm:
+pnpm --filter paperclipai build         # produces cli/dist/index.js
+node cli/dist/index.js tokens snapshot --company-id <company-id> --days 7 --format summary
+```
+
+The bundled CLI (`cli/dist/index.js`) externalizes `zod`, `postgres`, and `ws`;
+these are declared as `paperclipai` dependencies so `pnpm install` makes them
+resolvable for invocation (b). A globally-installed `paperclipai` release only
+carries this command once it has been published from a commit that includes it.
