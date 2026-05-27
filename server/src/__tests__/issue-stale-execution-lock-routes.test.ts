@@ -19,6 +19,8 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
+import { EXECUTION_LOCK_LEASE_TTL_MS } from "../services/issues.js";
+import { runningProcesses } from "../adapters/utils.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -34,6 +36,7 @@ if (!embeddedPostgresSupport.supported) {
 describeEmbeddedPostgres("stale issue execution lock routes", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+  const trackedRunIds: string[] = [];
 
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-stale-execution-lock-routes-");
@@ -41,6 +44,9 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
   }, 20_000);
 
   afterEach(async () => {
+    while (trackedRunIds.length > 0) {
+      runningProcesses.delete(trackedRunIds.pop()!);
+    }
     await db.delete(issueComments);
     await db.delete(issueRelations);
     await db.delete(activityLog);
@@ -131,6 +137,126 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
       source: "session",
     };
   }
+
+  async function insertRunningRun(
+    companyId: string,
+    agentId: string,
+    timestamps: { createdAt?: Date; startedAt?: Date; processStartedAt?: Date; lastOutputAt?: Date } = {},
+  ) {
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      status: "running",
+      invocationSource: "manual",
+      ...timestamps,
+    });
+    return runId;
+  }
+
+  function leaseExpiredTimestamps() {
+    const old = new Date(Date.now() - EXECUTION_LOCK_LEASE_TTL_MS - 60 * 60 * 1000);
+    return { createdAt: old, startedAt: old, processStartedAt: old, lastOutputAt: old };
+  }
+
+  it("auto-recovers a lease-expired, untracked ghost running-run lock on assignee checkout (HTTP)", async () => {
+    const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+    const ghostRunId = await insertRunningRun(companyId, agentId, leaseExpiredTimestamps());
+    expect(runningProcesses.has(ghostRunId)).toBe(false);
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Ghost running lock",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: null,
+      executionRunId: ghostRunId,
+      executionAgentNameKey: "codexcoder",
+      executionLockedAt: new Date(),
+    });
+
+    const res = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+      .post(`/api/issues/${issueId}/checkout`)
+      .send({ agentId, expectedStatuses: ["in_progress"] });
+
+    // Without liveness-based clearing, the ghost `running` lock would block the
+    // checkout and return 409. With the fix it is provably dead, so the assignee
+    // reclaims it on its own next checkout.
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const row = await db
+      .select({ checkoutRunId: issues.checkoutRunId, executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row).toEqual({ checkoutRunId: currentRunId, executionRunId: currentRunId });
+  });
+
+  it("refuses to reclaim a recently-active running-run lock on checkout (HTTP, 409)", async () => {
+    const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+    // Fresh activity -> lease not expired.
+    const liveRunId = await insertRunningRun(companyId, agentId, { createdAt: new Date(), startedAt: new Date() });
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Live running lock",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: null,
+      executionRunId: liveRunId,
+      executionAgentNameKey: "codexcoder",
+      executionLockedAt: new Date(),
+    });
+
+    const res = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+      .post(`/api/issues/${issueId}/checkout`)
+      .send({ agentId, expectedStatuses: ["in_progress"] });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    const row = await db
+      .select({ executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row?.executionRunId).toBe(liveRunId);
+  });
+
+  it("refuses to reclaim a process-tracked running-run lock on checkout even past its lease (HTTP, 409)", async () => {
+    const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+    const trackedGhostRunId = await insertRunningRun(companyId, agentId, leaseExpiredTimestamps());
+    // Process still tracked in memory -> authoritative liveness, never reclaim.
+    runningProcesses.set(trackedGhostRunId, { child: {} as never, graceSec: 0, processGroupId: null });
+    trackedRunIds.push(trackedGhostRunId);
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Tracked ghost lock",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: null,
+      executionRunId: trackedGhostRunId,
+      executionAgentNameKey: "codexcoder",
+      executionLockedAt: new Date(),
+    });
+
+    const res = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+      .post(`/api/issues/${issueId}/checkout`)
+      .send({ agentId, expectedStatuses: ["in_progress"] });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    const row = await db
+      .select({ executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row?.executionRunId).toBe(trackedGhostRunId);
+  });
 
   it("allows an assigned agent PATCH to recover a terminal stale executionRunId", async () => {
     const { companyId, agentId, failedRunId, currentRunId } = await seedCompanyAgentAndRuns();
