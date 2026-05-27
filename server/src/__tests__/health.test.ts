@@ -6,11 +6,13 @@ import { healthRoutes } from "../routes/health.js";
 import * as devServerStatus from "../dev-server-status.js";
 import { serverVersion } from "../version.js";
 
+
 const mockReadPersistedDevServerStatus = vi.hoisted(() => vi.fn());
 
 vi.mock("../dev-server-status.js", () => ({
   readPersistedDevServerStatus: mockReadPersistedDevServerStatus,
   toDevServerHealthStatus: vi.fn(),
+  writeDevServerRestartRequest: vi.fn(),
 }));
 
 function createApp(db?: Db) {
@@ -178,5 +180,83 @@ describe("GET /health", () => {
         companyDeletionEnabled: false,
       },
     });
+  });
+});
+
+describe("POST /health/dev-server/restart", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  async function createRestartApp() {
+    const ds = await import("../dev-server-status.js");
+    const { healthRoutes } = await import("../routes/health.js");
+    const app = express();
+    app.use(express.json());
+    app.use("/health", healthRoutes());
+    return { app, ds };
+  }
+
+  it("returns 404 when no dev server supervisor is running", async () => {
+    const { app, ds } = await createRestartApp();
+    vi.spyOn(ds, "readPersistedDevServerStatus").mockReturnValue(null);
+    const res = await request(app).post("/health/dev-server/restart").send({});
+    expect(res.status).toBe(404);
+    expect(res.body).toEqual({ error: "dev_server_supervisor_unavailable" });
+  });
+
+  it("returns 409 when the server is already up to date and force is not set", async () => {
+    const { app, ds } = await createRestartApp();
+    vi.spyOn(ds, "readPersistedDevServerStatus").mockReturnValue({
+      dirty: false,
+      changedPathCount: 0,
+      pendingMigrations: [],
+      changedPathsSample: [],
+      lastChangedAt: null,
+      lastRestartAt: null,
+    });
+    const writeSpy = vi.spyOn(ds, "writeDevServerRestartRequest").mockReturnValue(false);
+    const res = await request(app).post("/health/dev-server/restart").send({});
+    expect(res.status).toBe(409);
+    expect(res.body).toEqual({ error: "restart_not_required" });
+    expect(writeSpy).not.toHaveBeenCalled();
+  });
+
+  it("returns 202 and writes the restart request when changes are pending", async () => {
+    const { app, ds } = await createRestartApp();
+    vi.spyOn(ds, "readPersistedDevServerStatus").mockReturnValue({
+      dirty: true,
+      changedPathCount: 2,
+      pendingMigrations: [],
+      changedPathsSample: ["server/src/routes/foo.ts"],
+      lastChangedAt: "2026-05-27T00:00:00Z",
+      lastRestartAt: null,
+    });
+    const writeSpy = vi.spyOn(ds, "writeDevServerRestartRequest").mockReturnValue(true);
+    const res = await request(app).post("/health/dev-server/restart").send({});
+    expect(res.status).toBe(202);
+    expect(res.body).toEqual({ status: "restart_requested" });
+    expect(writeSpy).toHaveBeenCalledOnce();
+  });
+
+  // Regression: force=true must bypass the restartRequired gate so operators can recycle
+  // a stale binary when the dev-runner status file shows a clean state (PLA-166).
+  it("returns 202 when force=true even if the server appears clean", async () => {
+    const { app, ds } = await createRestartApp();
+    vi.spyOn(ds, "readPersistedDevServerStatus").mockReturnValue({
+      dirty: false,
+      changedPathCount: 0,
+      pendingMigrations: [],
+      changedPathsSample: [],
+      lastChangedAt: null,
+      lastRestartAt: null,
+    });
+    const writeSpy = vi.spyOn(ds, "writeDevServerRestartRequest").mockReturnValue(true);
+    const res = await request(app)
+      .post("/health/dev-server/restart")
+      .send({ force: true });
+    expect(res.status).toBe(202);
+    expect(res.body).toEqual({ status: "restart_requested" });
+    expect(writeSpy).toHaveBeenCalledOnce();
   });
 });

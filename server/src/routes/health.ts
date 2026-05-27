@@ -57,7 +57,9 @@ export function healthRoutes(
       return;
     }
 
+    const force = req.body?.force === true;
     const restartRequired =
+      force ||
       persistedDevServerStatus.dirty ||
       persistedDevServerStatus.changedPathCount > 0 ||
       persistedDevServerStatus.pendingMigrations.length > 0;

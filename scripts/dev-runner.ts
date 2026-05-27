@@ -353,6 +353,10 @@ function clearDevServerStatus() {
   rmSync(devServerRestartRequestFilePath, { force: true });
 }
 
+function peekDevServerRestartRequest() {
+  return mode === "dev" && existsSync(devServerRestartRequestFilePath);
+}
+
 function consumeDevServerRestartRequest() {
   if (mode !== "dev" || !existsSync(devServerRestartRequestFilePath)) return false;
   rmSync(devServerRestartRequestFilePath, { force: true });
@@ -642,8 +646,8 @@ async function startServerChild() {
 
 async function maybeAutoRestartChild() {
   if (mode !== "dev" || restartInFlight || !child) return;
-  const manualRestartRequested = consumeDevServerRestartRequest();
-  if (!manualRestartRequested && dirtyPaths.size === 0 && pendingMigrations.length === 0) return;
+  const hasRestartRequest = peekDevServerRestartRequest();
+  if (!hasRestartRequest && dirtyPaths.size === 0 && pendingMigrations.length === 0) return;
 
   restartInFlight = true;
   let health: { devServer?: { enabled?: boolean; autoRestartEnabled?: boolean; activeRunCount?: number } } | null = null;
@@ -654,19 +658,29 @@ async function maybeAutoRestartChild() {
     return;
   }
 
-  const devServer = health?.devServer;
-  if (!devServer?.enabled) {
-    restartInFlight = false;
-    return;
+  // Consume the restart file only after the health check succeeds, so a transient
+  // health failure does not silently eat the request without restarting.
+  const manualRestartRequested = hasRestartRequest && consumeDevServerRestartRequest();
+
+  if (!manualRestartRequested) {
+    // Auto-restart: require the feature enabled and server idle before restarting.
+    const devServer = health?.devServer;
+    if (!devServer?.enabled) {
+      restartInFlight = false;
+      return;
+    }
+    if (devServer.autoRestartEnabled !== true) {
+      restartInFlight = false;
+      return;
+    }
+    if ((devServer.activeRunCount ?? 0) > 0) {
+      restartInFlight = false;
+      return;
+    }
   }
-  if (!manualRestartRequested && devServer.autoRestartEnabled !== true) {
-    restartInFlight = false;
-    return;
-  }
-  if (!manualRestartRequested && (devServer.activeRunCount ?? 0) > 0) {
-    restartInFlight = false;
-    return;
-  }
+  // Manual restart: proceed regardless of autoRestartEnabled, activeRunCount, or
+  // whether devServer appears in the health response. The operator explicitly
+  // requested the recycle.
 
   try {
     await maybePreflightMigrations({

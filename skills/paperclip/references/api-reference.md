@@ -880,6 +880,67 @@ Terminal states: `done`, `cancelled`
 | POST   | `/api/companies/:companyId/secrets` | Create secret                       |
 | PATCH  | `/api/secrets/:secretId`            | Update secret value (creates new version) |
 
+### Dev-Server Supervisor (local dev only)
+
+These endpoints are only available when a dev-runner supervisor is managing the local server
+(i.e., `PAPERCLIP_DEV_SERVER_STATUS_FILE` is set in the running server's env).
+
+#### `GET /api/health`
+
+Returns a `devServer` object when the supervisor is active:
+
+```json
+{
+  "devServer": {
+    "enabled": true,
+    "restartRequired": true,
+    "reason": "backend_changes",
+    "changedPathCount": 3,
+    "autoRestartEnabled": false,
+    "activeRunCount": 0,
+    "waitingForIdle": false,
+    "lastRestartAt": "2026-05-27T08:35:00Z"
+  }
+}
+```
+
+#### `POST /api/health/dev-server/restart`
+
+Signals the dev-runner supervisor to recycle the child server process.
+
+**Request body (optional JSON):**
+
+| Field   | Type    | Default | Description |
+|---------|---------|---------|-------------|
+| `force` | boolean | `false` | Bypass the `restartRequired` gate — use when the status file shows clean but you know the binary is stale. |
+
+**Responses:**
+
+| Status | Body | Meaning |
+|--------|------|---------|
+| `202` | `{"status":"restart_requested"}` | Restart request written; dev-runner will recycle the child on its next poll (≤ 2.5 s). |
+| `404` | `{"error":"dev_server_supervisor_unavailable"}` | No supervisor is running or the request-file path cannot be resolved. |
+| `409` | `{"error":"restart_not_required"}` | Server is clean and `force` was not set. Use `{"force":true}` to override. |
+| `403` | `{"error":"board_access_required"}` | Authenticated-mode deployments require board auth. |
+
+**Behavior details:**
+
+- The restart is independent of `autoRestartEnabled`. A manual request always recycles the
+  child regardless of that setting.
+- The restart file is consumed only after the health check succeeds inside the dev-runner,
+  so a transient health check failure will not silently eat the request.
+- After the child is killed a new child is spawned; `GET /api/health` version will advance
+  and new routes will be available once the server finishes starting up.
+
+**Example — force restart a stale binary:**
+
+```bash
+curl -s -X POST http://127.0.0.1:3100/api/health/dev-server/restart \
+  -H 'Content-Type: application/json' \
+  -d '{"force":true}'
+# -> {"status":"restart_requested"}
+```
+
 ---
 
 ## Common Mistakes
