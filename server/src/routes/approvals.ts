@@ -6,6 +6,7 @@ import {
   requestApprovalRevisionSchema,
   resolveApprovalSchema,
   resubmitApprovalSchema,
+  withdrawApprovalSchema,
 } from "@paperclipai/shared";
 import { validate } from "../middleware/validate.js";
 import { logger } from "../middleware/logger.js";
@@ -316,6 +317,43 @@ export function approvalRoutes(
       entityId: approval.id,
       details: { type: approval.type },
     });
+    res.json(redactApprovalPayload(approval));
+  });
+
+  router.post("/approvals/:id/withdraw", validate(withdrawApprovalSchema), async (req, res) => {
+    const id = req.params.id as string;
+    const existing = await svc.getById(id);
+    if (!existing) {
+      res.status(404).json({ error: "Approval not found" });
+      return;
+    }
+    // Company scoping (also yields 403 for cross-company agent keys / board users).
+    assertCompanyAccess(req, existing.companyId);
+
+    // Least-privilege, controller-layer ownership gate: only the original requesting
+    // agent (or a board principal) may withdraw. Mirrors the requester-scoped check on
+    // POST /approvals/:id/resubmit so a different agent cannot retract someone else's
+    // approval via the normal API path (PLA-162).
+    if (req.actor.type === "agent" && req.actor.agentId !== existing.requestedByAgentId) {
+      res.status(403).json({ error: "Only the requesting agent can withdraw this approval" });
+      return;
+    }
+
+    // State guard lives in the service: non-pending approvals yield 409 Conflict.
+    const approval = await svc.withdraw(id, req.body.reason ?? null);
+
+    const actor = getActorInfo(req);
+    await logActivity(db, {
+      companyId: approval.companyId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      action: "approval.withdrawn",
+      entityType: "approval",
+      entityId: approval.id,
+      details: { type: approval.type, requestedByAgentId: approval.requestedByAgentId },
+    });
+
     res.json(redactApprovalPayload(approval));
   });
 

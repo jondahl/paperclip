@@ -419,6 +419,10 @@ export const APPROVAL_STATUSES = [
   "approved",
   "rejected",
   "cancelled",
+  // Requester-initiated retraction of an own pending approval. Distinct from the
+  // board-initiated `rejected`/`cancelled` terminal states so it stays analytically
+  // distinguishable from a board denial (PLA-162).
+  "withdrawn",
 ] as const;
 export type ApprovalStatus = (typeof APPROVAL_STATUSES)[number];
 

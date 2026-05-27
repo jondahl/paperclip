@@ -29,6 +29,15 @@ export const resubmitApprovalSchema = z.object({
 
 export type ResubmitApproval = z.infer<typeof resubmitApprovalSchema>;
 
+// Requester-scoped withdraw of an own pending approval (PLA-162). `reason` is the
+// audit note explaining why the requester retracted the approval; recommended but
+// optional, mirroring the optional decisionNote on board resolutions.
+export const withdrawApprovalSchema = z.object({
+  reason: multilineTextSchema.optional().nullable(),
+});
+
+export type WithdrawApproval = z.infer<typeof withdrawApprovalSchema>;
+
 export const addApprovalCommentSchema = z.object({
   body: multilineTextSchema.pipe(z.string().min(1)),
 });

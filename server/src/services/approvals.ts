@@ -1,7 +1,7 @@
 import { and, asc, eq, inArray } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { approvalComments, approvals } from "@paperclipai/db";
-import { notFound, unprocessable } from "../errors.js";
+import { conflict, notFound, unprocessable } from "../errors.js";
 import { redactCurrentUserText } from "../log-redaction.js";
 import { agentService } from "./agents.js";
 import { budgetService } from "./budgets.js";
@@ -228,6 +228,36 @@ export function approvalService(db: Db) {
         .where(eq(approvals.id, id))
         .returning()
         .then((rows) => rows[0]);
+    },
+
+    withdraw: async (id: string, reason?: string | null) => {
+      const existing = await getExistingApproval(id);
+      if (existing.status !== "pending") {
+        throw conflict("Only pending approvals can be withdrawn");
+      }
+
+      const now = new Date();
+      const updated = await db
+        .update(approvals)
+        .set({
+          status: "withdrawn",
+          // Persist the requester's reason and the withdraw timestamp. status="withdrawn"
+          // keeps this analytically distinguishable from a board rejection/cancellation.
+          decisionNote: reason ?? null,
+          decidedByUserId: null,
+          decidedAt: now,
+          updatedAt: now,
+        })
+        // Guard against a concurrent resolution: only transition if still pending.
+        .where(and(eq(approvals.id, id), eq(approvals.status, "pending")))
+        .returning()
+        .then((rows) => rows[0] ?? null);
+
+      if (updated) return updated;
+
+      // Lost the race to a board decision (or another withdraw); the approval is no
+      // longer pending, so surface the same conflict as the up-front guard.
+      throw conflict("Only pending approvals can be withdrawn");
     },
 
     listComments: async (approvalId: string) => {

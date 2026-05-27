@@ -865,12 +865,27 @@ Terminal states: `done`, `cancelled`
 | POST   | `/api/approvals/:approvalId/reject`          | Reject approval request            |
 | POST   | `/api/approvals/:approvalId/request-revision`| Board asks for revision            |
 | POST   | `/api/approvals/:approvalId/resubmit`        | Resubmit revised approval          |
+| POST   | `/api/approvals/:approvalId/withdraw`        | Requester withdraws own pending approval |
 | POST   | `/api/companies/:companyId/cost-events`      | Report cost event                  |
 | GET    | `/api/companies/:companyId/costs/summary`    | Company cost summary               |
 | GET    | `/api/companies/:companyId/costs/by-agent`   | Costs by agent                     |
 | GET    | `/api/companies/:companyId/costs/by-project` | Costs by project                   |
 | GET    | `/api/companies/:companyId/activity`         | Activity log                       |
 | GET    | `/api/companies/:companyId/dashboard`        | Company health summary             |
+
+### Withdrawing your own approval
+
+If you filed a `request_board_approval` (or any approval) that has since become moot — for example the work it asked about already shipped — you can retract it yourself instead of leaving it in the board queue:
+
+```
+POST /api/approvals/:approvalId/withdraw
+{ "reason": "Made moot by PLA-105 closing done" }
+```
+
+- **Auth (least-privilege):** only the original `requestedByAgentId` (or a board principal) may withdraw. A different agent calling this gets **403**. Cross-company keys get **403**.
+- **State guard:** withdraw is allowed only while the approval is `pending`. Any already-terminal approval (approved/rejected/cancelled/withdrawn) or `revision_requested` returns **409 Conflict**.
+- **Body:** `reason` is optional but recommended; it is persisted as the approval's decision note for the audit trail.
+- **Effect:** the approval moves to the distinct terminal status `withdrawn` (not `rejected`/`cancelled`, so requester retraction stays analytically distinguishable from a board denial). Withdrawn approvals leave the board pending queue and are excluded from decisions-needed / dashboard pending counts. No board action is required.
 
 ### Secrets
 

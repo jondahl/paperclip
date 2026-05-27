@@ -10,6 +10,7 @@ const mockApprovalService = vi.hoisted(() => ({
   reject: vi.fn(),
   requestRevision: vi.fn(),
   resubmit: vi.fn(),
+  withdraw: vi.fn(),
   listComments: vi.fn(),
   addComment: vi.fn(),
 }));
@@ -100,6 +101,7 @@ describe("approval routes idempotent retries", () => {
     mockApprovalService.reject.mockReset();
     mockApprovalService.requestRevision.mockReset();
     mockApprovalService.resubmit.mockReset();
+    mockApprovalService.withdraw.mockReset();
     mockApprovalService.listComments.mockReset();
     mockApprovalService.addComment.mockReset();
     mockHeartbeatService.wakeup.mockReset();
@@ -286,6 +288,76 @@ describe("approval routes idempotent retries", () => {
       "user-1",
       "Need changes",
     );
+  });
+
+  it("lets the requesting agent withdraw its own pending approval", async () => {
+    mockApprovalService.getById.mockResolvedValue({
+      id: "approval-7",
+      companyId: "company-1",
+      type: "request_board_approval",
+      status: "pending",
+      payload: {},
+      requestedByAgentId: "agent-1",
+    });
+    mockApprovalService.withdraw.mockResolvedValue({
+      id: "approval-7",
+      companyId: "company-1",
+      type: "request_board_approval",
+      status: "withdrawn",
+      payload: {},
+      requestedByAgentId: "agent-1",
+      decisionNote: "moot after PLA-105",
+    });
+
+    const res = await request(await createAgentApp())
+      .post("/api/approvals/approval-7/withdraw")
+      .send({ reason: "moot after PLA-105" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body).toMatchObject({ status: "withdrawn" });
+    expect(mockApprovalService.withdraw).toHaveBeenCalledWith("approval-7", "moot after PLA-105");
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ action: "approval.withdrawn", actorType: "agent" }),
+    );
+  });
+
+  it("forbids a non-requesting agent from withdrawing someone else's approval", async () => {
+    // Attacker-in-the-loop: a different agent in the same company tries the normal
+    // withdraw path. The controller-layer ownership gate must reject it (PLA-162).
+    mockApprovalService.getById.mockResolvedValue({
+      id: "approval-8",
+      companyId: "company-1",
+      type: "request_board_approval",
+      status: "pending",
+      payload: {},
+      requestedByAgentId: "some-other-agent",
+    });
+
+    const res = await request(await createAgentApp())
+      .post("/api/approvals/approval-8/withdraw")
+      .send({ reason: "not mine" });
+
+    expect(res.status).toBe(403);
+    expect(mockApprovalService.withdraw).not.toHaveBeenCalled();
+  });
+
+  it("forbids withdrawing an approval in another company", async () => {
+    mockApprovalService.getById.mockResolvedValue({
+      id: "approval-9",
+      companyId: "company-2",
+      type: "request_board_approval",
+      status: "pending",
+      payload: {},
+      requestedByAgentId: "agent-1",
+    });
+
+    const res = await request(await createAgentApp())
+      .post("/api/approvals/approval-9/withdraw")
+      .send({ reason: "cross-company" });
+
+    expect(res.status).toBe(403);
+    expect(mockApprovalService.withdraw).not.toHaveBeenCalled();
   });
 
   it("lets agents create generic issue-linked board approval requests", async () => {

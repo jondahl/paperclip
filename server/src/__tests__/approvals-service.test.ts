@@ -105,3 +105,45 @@ describe("approvalService resolution idempotency", () => {
     expect(mockNotifyHireApproved).toHaveBeenCalledTimes(1);
   });
 });
+
+describe("approvalService.withdraw (PLA-162)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("transitions a pending approval to withdrawn with the supplied reason", async () => {
+    const withdrawn = { ...createApproval("withdrawn"), decisionNote: "moot after PLA-105" };
+    const dbStub = createDbStub([[createApproval("pending")]], [withdrawn]);
+
+    const svc = approvalService(dbStub.db as any);
+    const result = await svc.withdraw("approval-1", "moot after PLA-105");
+
+    expect(result.status).toBe("withdrawn");
+    expect(result.decisionNote).toBe("moot after PLA-105");
+  });
+
+  it("rejects withdrawing a non-pending approval with a 409 conflict", async () => {
+    const dbStub = createDbStub([[createApproval("approved")]], []);
+
+    const svc = approvalService(dbStub.db as any);
+    await expect(svc.withdraw("approval-1", "too late")).rejects.toMatchObject({
+      status: 409,
+    });
+    // The state guard short-circuits before any update is attempted.
+    expect(dbStub.returning).not.toHaveBeenCalled();
+  });
+
+  it("surfaces a 409 conflict when a concurrent decision wins the pending guard", async () => {
+    // First select sees pending, but the guarded UPDATE matches no rows (another
+    // worker resolved it first), so the second read confirms the lost race.
+    const dbStub = createDbStub(
+      [[createApproval("pending")], [createApproval("rejected")]],
+      [],
+    );
+
+    const svc = approvalService(dbStub.db as any);
+    await expect(svc.withdraw("approval-1", "racing")).rejects.toMatchObject({
+      status: 409,
+    });
+  });
+});
