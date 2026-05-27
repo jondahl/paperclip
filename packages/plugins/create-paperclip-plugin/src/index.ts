@@ -1,11 +1,10 @@
-#!/usr/bin/env node
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const VALID_TEMPLATES = ["default", "connector", "workspace", "environment"] as const;
-type PluginTemplate = (typeof VALID_TEMPLATES)[number];
+export type PluginTemplate = (typeof VALID_TEMPLATES)[number];
 const VALID_CATEGORIES = new Set(["connector", "workspace", "automation", "ui", "environment"] as const);
 
 export interface ScaffoldPluginOptions {
@@ -27,7 +26,7 @@ export function isValidPluginName(name: string): boolean {
 }
 
 /** Convert `@scope/name` to an output directory basename (`name`). */
-function packageToDirName(pluginName: string): string {
+export function packageToDirName(pluginName: string): string {
   return pluginName.replace(/^@[^/]+\//, "");
 }
 
@@ -698,42 +697,4 @@ paperclipai plugin install ${shellQuote(toPosixPath(outputDir))}
   writeFile(path.join(outputDir, ".gitignore"), "dist\nnode_modules\n.paperclip-sdk\n");
 
   return outputDir;
-}
-
-function parseArg(name: string): string | undefined {
-  const index = process.argv.indexOf(name);
-  if (index === -1) return undefined;
-  return process.argv[index + 1];
-}
-
-/** CLI wrapper for `scaffoldPluginProject`. */
-function runCli() {
-  const pluginName = process.argv[2];
-  if (!pluginName) {
-    // eslint-disable-next-line no-console
-    console.error("Usage: create-paperclip-plugin <name> [--template default|connector|workspace] [--output <dir>] [--sdk-path <paperclip-sdk-path>]");
-    process.exit(1);
-  }
-
-  const template = (parseArg("--template") ?? "default") as PluginTemplate;
-  const outputRoot = parseArg("--output") ?? process.cwd();
-  const targetDir = path.resolve(outputRoot, packageToDirName(pluginName));
-
-  const out = scaffoldPluginProject({
-    pluginName,
-    outputDir: targetDir,
-    template,
-    displayName: parseArg("--display-name"),
-    description: parseArg("--description"),
-    author: parseArg("--author"),
-    category: parseArg("--category") as ScaffoldPluginOptions["category"] | undefined,
-    sdkPath: parseArg("--sdk-path"),
-  });
-
-  // eslint-disable-next-line no-console
-  console.log(`Created plugin scaffold at ${out}`);
-}
-
-if (import.meta.url === `file://${process.argv[1]}`) {
-  runCli();
 }
