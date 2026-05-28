@@ -58,6 +58,8 @@ import type {
   AdapterSessionCodec,
   UsageSummary,
 } from "../adapters/index.js";
+import { isClaudeTransientUpstreamError } from "@paperclipai/adapter-claude-local/server";
+import { isCodexTransientUpstreamError } from "@paperclipai/adapter-codex-local/server";
 import { createLocalAgentJwt } from "../agent-auth-jwt.js";
 import { parseObject, asBoolean, asNumber, appendWithByteCap, MAX_EXCERPT_BYTES } from "../adapters/utils.js";
 import { costService } from "./costs.js";
@@ -292,6 +294,28 @@ function readTransientRecoveryContractFromRun(
         retryNotBefore: readTransientRetryNotBeforeFromRun(run),
       }
     : null;
+}
+
+// Classify a thrown adapter / setup error message as a transient upstream
+// failure so the outer-catch can route it through scheduleBoundedRetryForRun
+// instead of stranding the agent in `error` (PLA-193). Adapter-specific
+// classifiers own the taxonomy; we just dispatch by adapter type here.
+function classifyAdapterErrorMessageAsTransientUpstream(
+  adapterType: string,
+  errorMessage: string | null | undefined,
+): { errorFamily: "transient_upstream"; errorCode: string } | null {
+  if (!errorMessage) return null;
+  if (adapterType === "claude_local") {
+    return isClaudeTransientUpstreamError({ errorMessage })
+      ? { errorFamily: "transient_upstream", errorCode: "claude_transient_upstream" }
+      : null;
+  }
+  if (adapterType === "codex_local") {
+    return isCodexTransientUpstreamError({ errorMessage })
+      ? { errorFamily: "transient_upstream", errorCode: "codex_transient_upstream" }
+      : null;
+  }
+  return null;
 }
 
 function mergeAdapterRecoveryMetadata(input: {
@@ -8113,14 +8137,29 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         logger.warn({ err: flushErr, runId }, "failed to flush run output progress after error");
       });
 
+      // PLA-193: classify thrown adapter errors so transient upstream failures
+      // (ConnectionRefused, socket hang up, etc.) flow into scheduleBoundedRetryForRun
+      // instead of stranding the agent in `error` until an operator intervenes.
+      const transientClassification = classifyAdapterErrorMessageAsTransientUpstream(
+        agent.adapterType,
+        message,
+      );
+      const failedErrorCode = transientClassification?.errorCode ?? "adapter_failed";
+      const baseStopMetadata = mergeRunStopMetadataForAgent(agent, "failed", {
+        errorCode: failedErrorCode,
+        errorMessage: message,
+      });
+      const failedResultJson = transientClassification
+        ? mergeAdapterRecoveryMetadata({
+            resultJson: baseStopMetadata,
+            errorFamily: transientClassification.errorFamily,
+          })
+        : baseStopMetadata;
       const failedRun = await setRunStatus(run.id, "failed", {
         error: message,
-        errorCode: "adapter_failed",
+        errorCode: failedErrorCode,
         finishedAt: new Date(),
-        resultJson: mergeRunStopMetadataForAgent(agent, "failed", {
-          errorCode: "adapter_failed",
-          errorMessage: message,
-        }),
+        resultJson: failedResultJson,
         stdoutExcerpt,
         stderrExcerpt,
         logBytes: logSummary?.bytes,
@@ -8141,6 +8180,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         });
         const livenessRun = await classifyAndPersistRunLiveness(failedRun) ?? failedRun;
         await refreshContinuationSummaryForRun(livenessRun, agent);
+        // PLA-193: mirror the inline-finalization branch at L8051-8053 so a
+        // thrown transient upstream error still triggers a bounded retry.
+        if (readTransientRecoveryContractFromRun(livenessRun)) {
+          await scheduleBoundedRetryForRun(livenessRun, agent);
+        }
         await finalizeIssueCommentPolicy(livenessRun, agent);
         await releaseIssueExecutionAndPromote(livenessRun);
 
@@ -8175,15 +8219,30 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           const message = outerErr instanceof Error ? outerErr.message : "Unknown setup failure";
           logger.error({ err: outerErr, runId }, "heartbeat execution setup failed");
           const setupFailureAgent = await getAgent(run.agentId).catch(() => null);
+          // PLA-193: same transient-upstream classification as the inner catch,
+          // so a setup-time ConnectionRefused/EAI_AGAIN/fetch-failed still gets a
+          // bounded retry instead of stranding the agent in `error`.
+          const setupTransientClassification = setupFailureAgent
+            ? classifyAdapterErrorMessageAsTransientUpstream(setupFailureAgent.adapterType, message)
+            : null;
+          const setupErrorCode = setupTransientClassification?.errorCode ?? "adapter_failed";
           await setRunStatus(runId, "failed", {
             error: message,
-            errorCode: "adapter_failed",
+            errorCode: setupErrorCode,
             finishedAt: new Date(),
             ...(setupFailureAgent ? {
-              resultJson: mergeRunStopMetadataForAgent(setupFailureAgent, "failed", {
-                errorCode: "adapter_failed",
-                errorMessage: message,
-              }),
+              resultJson: (() => {
+                const stop = mergeRunStopMetadataForAgent(setupFailureAgent, "failed", {
+                  errorCode: setupErrorCode,
+                  errorMessage: message,
+                });
+                return setupTransientClassification
+                  ? mergeAdapterRecoveryMetadata({
+                      resultJson: stop,
+                      errorFamily: setupTransientClassification.errorFamily,
+                    })
+                  : stop;
+              })(),
             } : {}),
           }).catch(() => undefined);
           await setWakeupStatus(run.wakeupRequestId, "failed", {
@@ -8204,6 +8263,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             const failedAgent = setupFailureAgent ?? await getAgent(run.agentId).catch(() => null);
             if (failedAgent) {
               await refreshContinuationSummaryForRun(livenessRun, failedAgent).catch(() => undefined);
+              if (readTransientRecoveryContractFromRun(livenessRun)) {
+                await scheduleBoundedRetryForRun(livenessRun, failedAgent).catch(() => undefined);
+              }
               await finalizeIssueCommentPolicy(livenessRun, failedAgent).catch(() => undefined);
             }
             await releaseIssueExecutionAndPromote(livenessRun).catch(() => undefined);

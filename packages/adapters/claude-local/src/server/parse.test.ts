@@ -95,6 +95,35 @@ describe("isClaudeTransientUpstreamError", () => {
       }),
     ).toBe(false);
   });
+
+  // PLA-193: thrown-error transient classification. ConnectionRefused-style
+  // failures (and the surrounding family of Node.js socket / DNS errors) used
+  // to fall through to `adapter_failed` and strand the agent in `error` until
+  // an operator intervened. Treat them as transient_upstream so the heartbeat
+  // outer-catch routes them through scheduleBoundedRetryForRun.
+  it.each([
+    ["ECONNREFUSED", "fetch failed: connect ECONNREFUSED 127.0.0.1:443"],
+    ["lowercase 'connection refused'", "Error: connection refused while contacting api.anthropic.com"],
+    ["socket hang up", "request to https://api.anthropic.com failed: socket hang up"],
+    ["ECONNRESET", "read ECONNRESET"],
+    ["EAI_AGAIN", "getaddrinfo EAI_AGAIN api.anthropic.com"],
+    ["bare 'getaddrinfo' failure", "getaddrinfo ENOTFOUND api.anthropic.com"],
+    ["fetch failed", "TypeError: fetch failed"],
+    ["ENETUNREACH", "connect ENETUNREACH 2606:4700::1111:443"],
+    ["ENOTFOUND", "getaddrinfo ENOTFOUND api.anthropic.com"],
+    ["EHOSTUNREACH", "connect EHOSTUNREACH 10.0.0.1:443"],
+    ["ETIMEDOUT", "connect ETIMEDOUT 10.0.0.1:443"],
+  ])("classifies %s as transient_upstream", (_label, errorMessage) => {
+    expect(isClaudeTransientUpstreamError({ errorMessage })).toBe(true);
+  });
+
+  it("does not over-match on benign messages that mention 'refused' alone", () => {
+    expect(
+      isClaudeTransientUpstreamError({
+        errorMessage: "User refused to grant tool permission",
+      }),
+    ).toBe(false);
+  });
 });
 
 describe("extractClaudeRetryNotBefore", () => {
