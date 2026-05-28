@@ -26,6 +26,8 @@ import {
 } from "../services/heartbeat.ts";
 import { recoveryService } from "../services/recovery/service.ts";
 import { getRunLogStore } from "../services/run-log-store.ts";
+import { runningProcesses } from "../adapters/index.ts";
+import { EXECUTION_LOCK_LEASE_TTL_MS } from "../services/issues.ts";
 
 const mockAdapterExecute = vi.hoisted(() =>
   vi.fn(async () => ({
@@ -92,6 +94,7 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
       await new Promise((resolve) => setTimeout(resolve, 25));
     }
     await db.execute(sql.raw(`TRUNCATE TABLE "companies" CASCADE`));
+    runningProcesses.clear();
   });
 
   afterAll(async () => {
@@ -106,6 +109,11 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
     sourceStatus?: "in_progress" | "done" | "cancelled";
     sourceOriginKind?: string;
     sameRunTerminalEvidence?: "activity" | "comment";
+    // PLA-165: defaults to true so existing tests describe the "alive but
+    // quiet" case — the watchdog evaluates the run but does not auto-
+    // terminalize. Set to false to exercise the autonomous lock-clear path
+    // (process gone + lease expired).
+    trackProcess?: boolean;
   }) {
     const companyId = randomUUID();
     const managerId = randomUUID();
@@ -179,6 +187,8 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
       contextSnapshot: { issueId },
       stdoutExcerpt: "OPENAI_API_KEY=sk-test-secret-value should not leak",
       logBytes: 0,
+      createdAt: startedAt,
+      updatedAt: startedAt,
     });
     if (opts.logChunk) {
       const store = getRunLogStore();
@@ -198,6 +208,9 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
         .where(eq(heartbeatRuns.id, runId));
     }
     await db.update(issues).set({ executionRunId: runId }).where(eq(issues.id, issueId));
+    if (opts.trackProcess !== false) {
+      runningProcesses.set(runId, { child: {} as never, graceSec: 0, processGroupId: null });
+    }
     if (opts.sameRunTerminalEvidence === "activity") {
       await db.insert(activityLog).values({
         companyId,
@@ -745,6 +758,104 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
         reason: "closed evaluation should not authorize",
       }),
     ).rejects.toMatchObject({ status: 403 });
+  });
+
+  // PLA-165: Layer-2 autonomous ghost-lock recovery. When the silent-active-run
+  // detector finds a candidate that satisfies the same "provably dead" predicate
+  // PLA-164 uses to release the execution lock (process gone + lease expired),
+  // the detector must terminalize the run and clear the lock without any live
+  // agent present, so a tombstone like PLA-93 / the 4.5h CEO outage cannot
+  // happen even when the assignee is also down.
+  it("auto-terminalizes a provably dead run and clears its execution lock with no live actor", async () => {
+    const now = new Date("2026-04-22T20:00:00.000Z");
+    const { companyId, issueId, runId } = await seedRunningRun({
+      now,
+      ageMs: EXECUTION_LOCK_LEASE_TTL_MS + 60 * 1000,
+      trackProcess: false,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const [beforeIssue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(beforeIssue?.executionRunId).toBe(runId);
+    const [beforeRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(beforeRun?.status).toBe("running");
+
+    const result = await heartbeat.scanSilentActiveRuns({ now, companyId });
+
+    expect(result).toMatchObject({
+      scanned: 1,
+      autoTerminalized: 1,
+      locksCleared: 1,
+      created: 0,
+      escalated: 0,
+      folded: 0,
+      snoozed: 0,
+      skipped: 0,
+    });
+
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(run?.status).toBe("timed_out");
+    expect(run?.errorCode).toBe("execution_lock_lease_expired");
+    expect(run?.finishedAt?.toISOString()).toBe(now.toISOString());
+
+    const [source] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(source?.executionRunId).toBeNull();
+    expect(source?.executionAgentNameKey).toBeNull();
+    expect(source?.executionLockedAt).toBeNull();
+
+    // No evaluation issue is created: the lock is already gone, so there's
+    // nothing for a recovery owner to triage.
+    const evaluations = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "stale_active_run_evaluation")));
+    expect(evaluations).toHaveLength(0);
+
+    const [logRow] = await db
+      .select()
+      .from(activityLog)
+      .where(and(
+        eq(activityLog.companyId, companyId),
+        eq(activityLog.action, "heartbeat.dead_run_auto_terminalized"),
+        eq(activityLog.runId, runId),
+      ));
+    expect(logRow).toBeTruthy();
+    expect(logRow?.details).toMatchObject({
+      reason: "execution_lock_lease_expired_and_process_gone",
+      lockedIssueId: issueId,
+      lockCleared: true,
+      executionLockLeaseTtlMs: EXECUTION_LOCK_LEASE_TTL_MS,
+    });
+
+    // Idempotency: a second sweep finds nothing because the run is no longer
+    // `running` (status filter excludes it). This proves the detector-driven
+    // recovery does not loop.
+    const second = await heartbeat.scanSilentActiveRuns({ now, companyId });
+    expect(second).toMatchObject({ scanned: 0, autoTerminalized: 0, locksCleared: 0 });
+  });
+
+  // PLA-165 negative: a run whose process is still tracked must NEVER be
+  // auto-terminalized, even past the lease window — the in-memory process
+  // handle is the authoritative liveness signal.
+  it("does not auto-terminalize a silent run while its process is still tracked", async () => {
+    const now = new Date("2026-04-22T20:00:00.000Z");
+    const { companyId, issueId, runId } = await seedRunningRun({
+      now,
+      ageMs: EXECUTION_LOCK_LEASE_TTL_MS + 60 * 1000,
+      trackProcess: true,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.scanSilentActiveRuns({ now, companyId });
+
+    expect(result.autoTerminalized).toBe(0);
+    expect(result.locksCleared).toBe(0);
+    expect(result.scanned).toBe(1);
+
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(run?.status).toBe("running");
+    const [source] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(source?.executionRunId).toBe(runId);
   });
 
   it("validates createdByRunId before storing watchdog decisions", async () => {

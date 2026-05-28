@@ -35,7 +35,11 @@ import { budgetService } from "../budgets.js";
 import { instanceSettingsService } from "../instance-settings.js";
 import { issueRecoveryActionService } from "../issue-recovery-actions.js";
 import { issueTreeControlService } from "../issue-tree-control.js";
-import { issueService } from "../issues.js";
+import {
+  EXECUTION_LOCK_LEASE_TTL_MS,
+  executionLockLeaseAgeMs,
+  issueService,
+} from "../issues.js";
 import { getRunLogStore } from "../run-log-store.js";
 import {
   DEFAULT_MAX_SUCCESSFUL_RUN_HANDOFF_ATTEMPTS,
@@ -1517,6 +1521,72 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return { kind: "created" as const, evaluationIssueId: evaluation.id };
   }
 
+  // Auto-terminalize a "provably dead" silent run and clear any execution lock
+  // it still holds (PLA-165, fast-follow on PLA-164).
+  //
+  // Mirrors the lock-clear predicate from server/src/services/issues.ts
+  // (clearExecutionRunIfReleasable): a non-terminal run is "provably dead" when
+  // its OS process is no longer tracked by the orchestrator AND its last
+  // observed activity is older than EXECUTION_LOCK_LEASE_TTL_MS. Layers 1–2
+  // only clear the lock when the assignee next acts; this path closes the loop
+  // so the lock clears with no live agent present — the case that caused the
+  // PLA-93 / PLA-110 ghost-lock tombstones.
+  async function autoTerminalizeProvablyDeadRun(input: {
+    run: typeof heartbeatRuns.$inferSelect;
+    now: Date;
+  }): Promise<{ runId: string; lockedIssueId: string | null; lockCleared: boolean } | null> {
+    if (input.run.status !== "running") return null;
+    if (runningProcesses.has(input.run.id)) return null;
+    const ageMs = executionLockLeaseAgeMs(input.run, input.now);
+    if (ageMs === null || ageMs < EXECUTION_LOCK_LEASE_TTL_MS) return null;
+
+    const [lockedIssue] = await db
+      .select({ id: issues.id, identifier: issues.identifier })
+      .from(issues)
+      .where(eq(issues.executionRunId, input.run.id))
+      .limit(1);
+
+    const [updatedRun] = await db
+      .update(heartbeatRuns)
+      .set({
+        status: "timed_out",
+        finishedAt: input.now,
+        error: "Auto-terminalized by silent-run watchdog: process gone and execution-lock lease expired (PLA-165).",
+        errorCode: "execution_lock_lease_expired",
+        updatedAt: input.now,
+      })
+      .where(and(eq(heartbeatRuns.id, input.run.id), eq(heartbeatRuns.status, "running")))
+      .returning();
+    if (!updatedRun) return null;
+
+    let lockCleared = false;
+    if (lockedIssue) {
+      lockCleared = await issuesSvc.clearExecutionRunIfReleasable(lockedIssue.id, input.now);
+    }
+
+    await logActivity(db, {
+      companyId: input.run.companyId,
+      actorType: "system",
+      actorId: "system",
+      agentId: input.run.agentId,
+      runId: input.run.id,
+      action: "heartbeat.dead_run_auto_terminalized",
+      entityType: "heartbeat_run",
+      entityId: input.run.id,
+      details: {
+        source: "recovery.scan_silent_active_runs",
+        reason: "execution_lock_lease_expired_and_process_gone",
+        lockedIssueId: lockedIssue?.id ?? null,
+        lockedIssueIdentifier: lockedIssue?.identifier ?? null,
+        lockCleared,
+        executionLockLeaseAgeMs: ageMs,
+        executionLockLeaseTtlMs: EXECUTION_LOCK_LEASE_TTL_MS,
+      },
+    });
+
+    return { runId: input.run.id, lockedIssueId: lockedIssue?.id ?? null, lockCleared };
+  }
+
   async function scanSilentActiveRuns(opts?: { now?: Date; companyId?: string }) {
     const now = opts?.now ?? new Date();
     const suspicionBefore = new Date(now.getTime() - ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS);
@@ -1541,10 +1611,21 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       folded: 0,
       snoozed: 0,
       skipped: 0,
+      autoTerminalized: 0,
+      locksCleared: 0,
       evaluationIssueIds: [] as string[],
     };
 
     for (const run of candidates) {
+      // PLA-165: when the same predicate that PLA-164 uses to clear an
+      // execution lock would succeed, close the loop here — terminalize the
+      // run and clear the lock without waiting for the assignee to wake up.
+      const dead = await autoTerminalizeProvablyDeadRun({ run, now });
+      if (dead) {
+        result.autoTerminalized += 1;
+        if (dead.lockCleared) result.locksCleared += 1;
+        continue;
+      }
       if (await latestActiveOutputQuietUntilDecision(run.companyId, run.id, now)) {
         result.snoozed += 1;
         continue;
