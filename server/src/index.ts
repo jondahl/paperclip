@@ -750,8 +750,8 @@ export async function startServer(): Promise<StartedServer> {
       })
       .then(async () => {
         const scanned = await heartbeat.scanSilentActiveRuns();
-        if (scanned.created > 0 || scanned.escalated > 0) {
-          logger.warn({ ...scanned }, "startup active-run output watchdog created review work");
+        if (scanned.created > 0 || scanned.escalated > 0 || scanned.autoTerminalized > 0) {
+          logger.warn({ ...scanned }, "startup active-run output watchdog created review work or auto-cleared dead runs");
         }
       })
       .then(async () => {
@@ -816,8 +816,8 @@ export async function startServer(): Promise<StartedServer> {
         })
         .then(async () => {
           const scanned = await heartbeat.scanSilentActiveRuns();
-          if (scanned.created > 0 || scanned.escalated > 0) {
-            logger.warn({ ...scanned }, "periodic active-run output watchdog created review work");
+          if (scanned.created > 0 || scanned.escalated > 0 || scanned.autoTerminalized > 0) {
+            logger.warn({ ...scanned }, "periodic active-run output watchdog created review work or auto-cleared dead runs");
           }
         })
         .then(async () => {
